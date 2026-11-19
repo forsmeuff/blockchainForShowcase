@@ -66,32 +66,60 @@ export default function AuctionPanel({
   async function pay() {
     if (!won) return;
     setError(null);
+    let txHash: string;
+    let payer: string;
     try {
       const { signer, address } = await connectWallet();
+      payer = address;
       const erc20 = getToken(signer);
       const allowance: bigint = await erc20.allowance(address, ESCROW_ADDRESS);
       if (allowance < won.total) {
         setPhase("approve");
-        await (await erc20.approve(ESCROW_ADDRESS, won.total)).wait();
+        const approval = await erc20.approve(ESCROW_ADDRESS, won.total);
+        const approvalReceipt = await approval.wait();
+        if (!approvalReceipt || approvalReceipt.status !== 1) {
+          throw new Error("Token approval was not confirmed. No payment was submitted.");
+        }
       }
+
       setPhase("pay");
       const tx = await getEscrow(signer).payAuction(won.auctionId);
-      await tx.wait();
+      const receipt = await tx.wait();
+      if (!receipt || receipt.status !== 1) throw new Error("The payment transaction was not confirmed.");
+      txHash = tx.hash;
+    } catch (e) {
+      setError(explainError(e));
+      return;
+    } finally {
+      setPhase("idle");
+    }
 
+    // The chain is authoritative: do not report the payment as failed because a
+    // subsequent API call or balance refresh fails. Clear the paid auction as
+    // soon as its transaction has been mined successfully.
+    setPaidTx(txHash);
+    setWon(null);
+    onWinner(undefined);
+    onPaid();
+
+    try {
       await api("/api/sessions", {
         token,
         body: {
           vehicleId: won.vehicleId, stationId: won.station.id, kwh: Number(won.kwh),
           ratePerKwh: formatUnits(won.rate, 18), totalCost: formatUnits(won.total, 18),
-          auctionId: won.auctionId.toString(), txHash: tx.hash,
+          auctionId: won.auctionId.toString(), txHash,
         },
       });
-      setPaidTx(tx.hash);
-      setWon(null); onWinner(undefined);
-      await wallet.refreshBalance(address);
-      onPaid();
-    } catch (e) { setError(explainError(e)); }
-    finally { setPhase("idle"); }
+    } catch (e) {
+      setError(`Payment confirmed on-chain (${shortAddr(txHash)}), but the charging session could not be saved: ${explainError(e)}`);
+    }
+
+    try {
+      await wallet.refreshBalance(payer);
+    } catch {
+      // A balance refresh failure must not make a mined payment look unsuccessful.
+    }
   }
 
   async function cancel() {
@@ -148,7 +176,7 @@ export default function AuctionPanel({
         </div>
       )}
 
-      {paidTx && <p className="success">Paid. Head to the station — your charge is booked. (tx {shortAddr(paidTx)})</p>}
+      {paidTx && <p className="success">Payment confirmed on-chain. (tx {shortAddr(paidTx)})</p>}
       {error && <p className="error" role="alert">{error}</p>}
     </section>
   );
